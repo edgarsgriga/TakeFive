@@ -53,9 +53,30 @@ def _write_state(next_break_at, break_count):
             json.dump({
                 "nextBreakAt": next_break_at,
                 "breakCount": break_count,
+                "writtenAt": time.time(),
             }, f)
     except Exception:
         pass
+
+
+def _read_state():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _resume_break_count():
+    """Carry breakCount across daemon restarts so long-break cadence is stable.
+    Discard if stale (>6h) since the user has effectively started a new day."""
+    s = _read_state()
+    if not s:
+        return 0
+    written = s.get("writtenAt", 0)
+    if time.time() - written > 6 * 3600:
+        return 0
+    return int(s.get("breakCount", 0))
 
 # === Config (read from config.json, falls back to defaults) ===
 _cfg = _load_config()
@@ -63,7 +84,7 @@ WORK_INTERVAL    = max(1, _cfg.get("workIntervalMin", 20)) * 60
 SHORT_BREAK      = max(5, _cfg.get("shortBreakSec", 20))
 LONG_BREAK_EVERY = max(1, _cfg.get("longBreakEvery", 3))
 LONG_BREAK       = max(1, _cfg.get("longBreakMin", 5)) * 60
-PRE_WARNING      = max(0, _cfg.get("preWarningSec", 10))
+PRE_WARNING      = min(max(0, _cfg.get("preWarningSec", 10)), WORK_INTERVAL - 1)
 IDLE_SKIP        = 5 * 60
 
 PAUSE_FILE = os.path.expanduser("~/.break_enforcer_pause")
@@ -168,19 +189,6 @@ def is_zoom_in_meeting():
         return False
 
 
-def is_dnd_active():
-    """Best effort: check macOS Focus / Do Not Disturb state."""
-    try:
-        path = os.path.expanduser("~/Library/DoNotDisturb/DB/Assertions.json")
-        if os.path.exists(path) and os.path.getsize(path) > 60:
-            with open(path) as f:
-                content = f.read()
-            return '"storeAssertionRecords"' in content and len(content) > 200
-    except Exception:
-        pass
-    return False
-
-
 def get_idle_seconds():
     try:
         out = subprocess.run(['ioreg', '-c', 'IOHIDSystem'],
@@ -214,14 +222,13 @@ def is_paused():
 
 def reason_to_skip():
     paused, info = is_paused()
-    if paused:                   return f"paused ({info})"
-    if is_camera_in_use():       return "camera in use (call/recording)"
-    if is_zoom_in_meeting():     return "Zoom meeting active"
-    if is_keynote_presenting():  return "Keynote presenting"
+    if paused:                    return f"paused ({info})"
+    if is_camera_in_use():        return "camera in use (call/recording)"
+    if is_zoom_in_meeting():      return "Zoom meeting active"
+    if is_keynote_presenting():   return "Keynote presenting"
     if is_powerpoint_presenting():return "PowerPoint presenting"
-    if is_dnd_active():          return "Do Not Disturb on"
     idle = get_idle_seconds()
-    if idle > IDLE_SKIP:         return f"already idle {int(idle//60)} min"
+    if idle > IDLE_SKIP:          return f"already idle {int(idle//60)} min"
     return None
 
 
@@ -237,9 +244,11 @@ def speak(text):
 
 
 def notify(msg, title="Break Enforcer"):
+    def esc(s):
+        return s.replace("\\", "\\\\").replace('"', '\\"')
     subprocess.Popen(
         ['osascript', '-e',
-         f'display notification "{msg}" with title "{title}" sound name "Tink"'],
+         f'display notification "{esc(msg)}" with title "{esc(title)}" sound name "Tink"'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
 
@@ -333,7 +342,7 @@ def run():
     print("  Stop:   Ctrl+C   (or: pkill -f break_enforcer.py)")
     print("=" * 64)
 
-    break_count = 0
+    break_count = _resume_break_count()
     while True:
         next_break = time.time() + WORK_INTERVAL
         _write_state(next_break, break_count)

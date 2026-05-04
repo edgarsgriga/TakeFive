@@ -68,10 +68,9 @@ func pauseInfo() -> (paused: Bool, info: String?) {
 }
 
 // MARK: - App Delegate
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var statusItem: NSStatusItem!
     var pythonProcess: Process?
-    var menuTimer: Timer?
     var settingsWindow: NSWindow?
     var settingsFields: [NSTextField] = []
 
@@ -79,9 +78,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         appendLog("===== menubar launch \(Date()) =====")
         setupStatusBar()
         startDaemon()
-        menuTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.refreshMenu()
-        }
         notify("Break Enforcer running. Click the menu bar icon for controls.")
     }
 
@@ -106,11 +102,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 button.title = "BE"
             }
         }
+        let menu = NSMenu()
+        menu.delegate = self
+        statusItem.menu = menu
+        refreshMenu()
+    }
+
+    // NSMenuDelegate: rebuild only when the user actually opens the menu.
+    // Avoids spawning pgrep/osascript every 5s in the background.
+    func menuNeedsUpdate(_ menu: NSMenu) {
         refreshMenu()
     }
 
     func refreshMenu() {
-        let menu = NSMenu()
+        guard let menu = statusItem?.menu else { return }
+        menu.removeAllItems()
 
         // Status header (disabled item)
         let header = NSMenuItem(title: statusText(), action: nil, keyEquivalent: "")
@@ -143,8 +149,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         menu.addItem(item("Quit Break Enforcer",  #selector(quitApp), key: "q"))
-
-        statusItem.menu = menu
     }
 
     func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
@@ -198,11 +202,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let p = Process()
         p.launchPath = "/usr/bin/python3"
         p.arguments = [SCRIPT_PATH]
-        let log = FileHandle(forWritingAtPath: LOG_PATH)
-            ?? { FileManager.default.createFile(atPath: LOG_PATH, contents: nil); return FileHandle(forWritingAtPath: LOG_PATH)! }()
-        log.seekToEndOfFile()
-        p.standardOutput = log
-        p.standardError = log
+        if let log = openLogForAppend() {
+            p.standardOutput = log
+            p.standardError = log
+        }
         do {
             try p.run()
             pythonProcess = p
@@ -210,6 +213,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } catch {
             appendLog("FAILED to start daemon: \(error)")
         }
+    }
+
+    private func openLogForAppend() -> FileHandle? {
+        if !FileManager.default.fileExists(atPath: LOG_PATH) {
+            FileManager.default.createFile(atPath: LOG_PATH, contents: nil)
+        }
+        guard let h = FileHandle(forWritingAtPath: LOG_PATH) else { return nil }
+        h.seekToEndOfFile()
+        return h
     }
 
     func stopDaemon() {
@@ -410,9 +422,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
 // MARK: - Helpers
 func notify(_ msg: String) {
+    let safe = msg
+        .replacingOccurrences(of: "\\", with: "\\\\")
+        .replacingOccurrences(of: "\"", with: "\\\"")
     let p = Process()
     p.launchPath = "/usr/bin/osascript"
-    p.arguments = ["-e", "display notification \"\(msg)\" with title \"Break Enforcer\""]
+    p.arguments = ["-e", "display notification \"\(safe)\" with title \"Break Enforcer\""]
     try? p.run()
 }
 
