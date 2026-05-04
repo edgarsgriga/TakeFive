@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Build artifacts inside the .app
+BreakEnforcer.app/Contents/MacOS/BreakEnforcer
+BreakEnforcer.app/Contents/MacOS/break_window
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local user state (should never be committed)
+*.log
+state.json
