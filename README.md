@@ -1,12 +1,42 @@
-# Take Five
-
 <p align="center">
-  <img src="icon.png" width="200" alt="Take Five icon">
+  <img src="icon.png" width="140" alt="Take Five icon">
 </p>
 
-A 20-20-20 break reminder for macOS. Pops up a fullscreen "look away" break every 20 minutes (eye rest) and a longer 5-minute break every hour (get up, stretch, walk, drink water).
+<h1 align="center">Take Five</h1>
 
-Auto-skips during meetings, presentations, and idle time. Pause from the menu bar when needed.
+<p align="center">
+  A 20-20-20 break reminder for macOS. Forces a fullscreen "look away" break every 20 minutes (eye rest) and a longer 5-minute break every hour (get up, stretch, walk, drink water).
+</p>
+
+<p align="center">
+  Auto-skips during meetings, presentations, and idle time. Pause from the menu bar when needed.
+</p>
+
+## Screenshots
+
+### When a break fires
+
+A fullscreen black takeover with a randomized prompt (DESK PUSHUPS, LOOK AWAY, ROLL SHOULDERS, etc.), a countdown, and what to actually do. The hint at the bottom shows the escape: triple-tap Esc within 2 seconds to skip.
+
+<p align="center">
+  <img src="screenshots/break-overlay.png" alt="Fullscreen break overlay" width="800">
+</p>
+
+### Menu bar dropdown
+
+Click the **5** icon in your menu bar (top right of the screen) for live status, instant pause, settings, and quit.
+
+<p align="center">
+  <img src="screenshots/menu-bar.png" alt="Menu bar dropdown" width="380">
+</p>
+
+### Settings
+
+Five fields, all in plain English. Saving restarts the timer immediately so changes take effect on the next break.
+
+<p align="center">
+  <img src="screenshots/settings.png" alt="Settings window" width="640">
+</p>
 
 ## Features
 
