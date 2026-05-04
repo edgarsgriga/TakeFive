@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-20-20-20 Break Enforcer for macOS
+Take Five - 20-20-20 break daemon for macOS
 
 Default: short 20s break every 20 min, long 5-min break every 3rd cycle.
-Auto-skips during meetings, presentations, Do Not Disturb, or while idle.
+Auto-skips during meetings, presentations, and while idle.
 
 Run normally:
     python3 break_enforcer.py
@@ -33,7 +33,7 @@ from datetime import datetime
 HERE = os.path.dirname(os.path.abspath(__file__))
 BREAK_WINDOW_BIN = os.path.normpath(os.path.join(HERE, "..", "MacOS", "break_window"))
 
-APP_SUPPORT = os.path.expanduser("~/Library/Application Support/BreakEnforcer")
+APP_SUPPORT = os.path.expanduser("~/Library/Application Support/TakeFive")
 CONFIG_PATH = os.path.join(APP_SUPPORT, "config.json")
 STATE_PATH = os.path.join(APP_SUPPORT, "state.json")
 
@@ -87,8 +87,8 @@ LONG_BREAK       = max(1, _cfg.get("longBreakMin", 5)) * 60
 PRE_WARNING      = min(max(0, _cfg.get("preWarningSec", 10)), WORK_INTERVAL - 1)
 IDLE_SKIP        = 5 * 60
 
-PAUSE_FILE = os.path.expanduser("~/.break_enforcer_pause")
-LOG = "[break-enforcer]"
+PAUSE_FILE = os.path.expanduser("~/.takefive_pause")
+LOG = "[take-five]"
 
 # === Reminder variety ===
 SHORT_PROMPTS = [
@@ -243,7 +243,7 @@ def speak(text):
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def notify(msg, title="Break Enforcer"):
+def notify(msg, title="Take Five"):
     def esc(s):
         return s.replace("\\", "\\\\").replace('"', '\\"')
     subprocess.Popen(
@@ -325,7 +325,7 @@ def cli_test():
 
 
 def handle_sigint(signum, frame):
-    print("\nBreak enforcer stopped. Take care of those eyes.")
+    print("\nTake Five stopped. Take care of those eyes.")
     sys.exit(0)
 
 
@@ -333,10 +333,10 @@ def run():
     signal.signal(signal.SIGINT, handle_sigint)
 
     print("=" * 64)
-    print("  20-20-20 Break Enforcer")
+    print("  Take Five - 20-20-20 break daemon")
     print(f"  Short break every {WORK_INTERVAL//60} min for {SHORT_BREAK}s")
-    print(f"  Long break every {LONG_BREAK_EVERY * WORK_INTERVAL//60} min for {LONG_BREAK//60} min")
-    print("  Auto-skips: meetings, Keynote/PPT, camera, DND, idle")
+    print(f"  Long break every {LONG_BREAK_EVERY * (WORK_INTERVAL//60)} min for {LONG_BREAK//60} min")
+    print("  Auto-skips: meetings, Keynote/PPT, camera, idle")
     print("  Pause:  python3 break_enforcer.py pause 30")
     print("  Resume: python3 break_enforcer.py resume")
     print("  Stop:   Ctrl+C   (or: pkill -f break_enforcer.py)")

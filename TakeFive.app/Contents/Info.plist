@@ -3,17 +3,19 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>BreakEnforcer</string>
+    <string>TakeFive</string>
     <key>CFBundleDisplayName</key>
-    <string>Break Enforcer</string>
+    <string>Take Five</string>
     <key>CFBundleIdentifier</key>
-    <string>com.edgarsgriga.breakenforcer</string>
+    <string>com.edgarsgriga.takefive</string>
     <key>CFBundleVersion</key>
     <string>1.0</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
     <key>CFBundleExecutable</key>
-    <string>BreakEnforcer</string>
+    <string>TakeFive</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleSignature</key>

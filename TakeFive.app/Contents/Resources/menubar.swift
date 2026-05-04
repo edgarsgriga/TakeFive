@@ -1,23 +1,23 @@
 // menubar.swift
-// Menu bar app for BreakEnforcer.
+// Menu bar app for Take Five.
 // - Spawns the Python daemon
 // - Shows a status icon in the menu bar with controls
 // - Provides a Settings window backed by config.json
-//
-// Compiled to ../MacOS/BreakEnforcer (replaces the bash launcher).
 
 import Cocoa
 
 // MARK: - Paths
 let HOME = NSHomeDirectory()
-let APP_SUPPORT = HOME + "/Library/Application Support/BreakEnforcer"
+let APP_SUPPORT = HOME + "/Library/Application Support/TakeFive"
 let CONFIG_PATH = APP_SUPPORT + "/config.json"
 let STATE_PATH  = APP_SUPPORT + "/state.json"
-let PAUSE_PATH  = HOME + "/.break_enforcer_pause"
+let PAUSE_PATH  = HOME + "/.takefive_pause"
 
 let RESOURCES   = Bundle.main.resourcePath ?? ""
 let SCRIPT_PATH = RESOURCES + "/break_enforcer.py"
-let LOG_PATH    = HOME + "/Library/Logs/BreakEnforcer.log"
+let LOG_PATH    = HOME + "/Library/Logs/TakeFive.log"
+
+let APP_TITLE   = "Take Five"
 
 // MARK: - Config
 struct Config: Codable {
@@ -78,7 +78,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         appendLog("===== menubar launch \(Date()) =====")
         setupStatusBar()
         startDaemon()
-        notify("Break Enforcer running. Click the menu bar icon for controls.")
+        notify("\(APP_TITLE) is running. Click the menu bar icon for controls.")
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -96,10 +96,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func setupStatusBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            if let img = NSImage(systemSymbolName: "eye.circle", accessibilityDescription: "Break Enforcer") {
+            if let img = NSImage(systemSymbolName: "5.circle", accessibilityDescription: APP_TITLE) {
                 button.image = img
             } else {
-                button.title = "BE"
+                button.title = "T5"
             }
         }
         let menu = NSMenu()
@@ -148,7 +148,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(.separator())
 
-        menu.addItem(item("Quit Break Enforcer",  #selector(quitApp), key: "q"))
+        menu.addItem(item("Quit \(APP_TITLE)",    #selector(quitApp), key: "q"))
     }
 
     func item(_ title: String, _ action: Selector, key: String = "") -> NSMenuItem {
@@ -320,7 +320,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             contentRect: NSRect(x: 0, y: 0, width: 460, height: 360),
             styleMask: [.titled, .closable],
             backing: .buffered, defer: false)
-        w.title = "Break Enforcer Settings"
+        w.title = "\(APP_TITLE) Settings"
         w.center()
         w.isReleasedWhenClosed = false
 
@@ -427,7 +427,7 @@ func notify(_ msg: String) {
         .replacingOccurrences(of: "\"", with: "\\\"")
     let p = Process()
     p.launchPath = "/usr/bin/osascript"
-    p.arguments = ["-e", "display notification \"\(safe)\" with title \"Break Enforcer\""]
+    p.arguments = ["-e", "display notification \"\(safe)\" with title \"\(APP_TITLE)\""]
     try? p.run()
 }
 
