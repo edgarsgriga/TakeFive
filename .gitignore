@@ -5,10 +5,6 @@
 Icon
 ._*
 
-# Build artifacts inside the .app
-BreakEnforcer.app/Contents/MacOS/BreakEnforcer
-BreakEnforcer.app/Contents/MacOS/break_window
-
 # Editor / IDE
 .vscode/
 .idea/

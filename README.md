@@ -21,11 +21,8 @@ Auto-skips during meetings, presentations, Do Not Disturb, and idle time. Pause 
 
 ## Requirements
 
-- macOS 11 (Big Sur) or newer (tested on macOS 26 Tahoe)
-- Xcode Command Line Tools (for the recompile step). If missing, install with:
-  ```
-  xcode-select --install
-  ```
+- macOS 11 (Big Sur) or newer, **Apple Silicon** (M1/M2/M3/M4 etc.)
+- No other dependencies. Prebuilt binaries are included.
 
 ## Install
 
@@ -40,7 +37,7 @@ Auto-skips during meetings, presentations, Do Not Disturb, and idle time. Pause 
    - Click **Open** again in the dialog that appears
 
    This is a one-time hurdle for unsigned apps. You only need to do it once per machine.
-4. The installer copies BreakEnforcer.app to `/Applications`, recompiles the Swift binaries for your Mac's architecture, removes the quarantine flag, and launches the app.
+4. The installer copies BreakEnforcer.app to `/Applications`, removes the quarantine flag, and launches the app.
 5. Look for the eye icon in your menu bar (top right of screen).
 
 ### If the .app itself shows a warning
