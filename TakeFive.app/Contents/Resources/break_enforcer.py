@@ -26,6 +26,7 @@ import sys
 import os
 import signal
 import json
+import re
 from datetime import datetime
 
 # Native fullscreen break window. Compiled from break_window.swift sitting
@@ -46,13 +47,17 @@ def _load_config():
         return {}
 
 
-def _write_state(next_break_at, break_count):
+def _write_state(next_break_at, break_count, last_squats_at=0, skip_reason=None):
     try:
         os.makedirs(APP_SUPPORT, exist_ok=True)
         with open(STATE_PATH, "w") as f:
             json.dump({
                 "nextBreakAt": next_break_at,
                 "breakCount": break_count,
+                "lastSquatsAt": last_squats_at,
+                # Last reason a break was skipped, for the menu bar to show
+                # immediately instead of recomputing on the main thread.
+                "skipReason": skip_reason,
                 "writtenAt": time.time(),
             }, f)
     except Exception:
@@ -67,16 +72,18 @@ def _read_state():
         return None
 
 
-def _resume_break_count():
-    """Carry breakCount across daemon restarts so long-break cadence is stable.
-    Discard if stale (>6h) since the user has effectively started a new day."""
-    s = _read_state()
-    if not s:
-        return 0
-    written = s.get("writtenAt", 0)
-    if time.time() - written > 6 * 3600:
-        return 0
-    return int(s.get("breakCount", 0))
+def _resume_session():
+    """Carry breakCount and the last squats time across daemon restarts from a
+    single snapshot, so the two can never come from different reads. Discard a
+    stale snapshot (>6h) since the user has effectively started a new day."""
+    s = _read_state() or {}
+    if time.time() - s.get("writtenAt", 0) > 6 * 3600:
+        return 0, 0.0
+    last_squats = float(s.get("lastSquatsAt", 0) or 0)
+    if time.time() - last_squats > SQUATS_INTERVAL:
+        last_squats = 0.0
+    return int(s.get("breakCount", 0)), last_squats
+
 
 # === Config (read from config.json, falls back to defaults) ===
 _cfg = _load_config()
@@ -86,6 +93,19 @@ LONG_BREAK_EVERY = max(1, _cfg.get("longBreakEvery", 3))
 LONG_BREAK       = max(1, _cfg.get("longBreakMin", 5)) * 60
 PRE_WARNING      = min(max(0, _cfg.get("preWarningSec", 10)), WORK_INTERVAL - 1)
 IDLE_SKIP        = 5 * 60
+
+# Hourly squats anchor. When on, one long break per hour is always squats
+# instead of a random pick, so legs get a guaranteed dose no matter how the
+# dice fall.
+SQUATS_EVERY_HOUR = bool(_cfg.get("squatsEveryHour", True))
+SQUATS_INTERVAL   = 3600
+# Breaks rarely land exactly on the hour, so claim the break nearest each
+# hourly target. Half an interval of slack keeps the long-run rate at one per
+# hour instead of drifting a whole cycle late every time.
+SQUATS_GRACE      = WORK_INTERVAL // 2
+
+# Extra app-name fragments to treat as "busy", on top of the built-in list.
+EXTRA_BUSY_APPS   = tuple(_cfg.get("busyApps", []) or ())
 
 PAUSE_FILE = os.path.expanduser("~/.takefive_pause")
 LOG = "[take-five]"
@@ -110,7 +130,6 @@ SHORT_PROMPTS = [
 
 LONG_PROMPTS = [
     ("PUSHUPS",         "10 pushups. Wall pushups count. Go."),
-    ("SQUATS",          "20 bodyweight squats. Slow and controlled."),
     ("PLANK",           "60-second plank. Set a timer on your phone."),
     ("JUMPING JACKS",   "30 jumping jacks. Heart rate up."),
     ("WALK",            "Walk to another room. Or outside. Just move."),
@@ -125,30 +144,152 @@ LONG_PROMPTS = [
     ("HIP OPENERS",     "Pigeon pose or figure-4 stretch. Both sides."),
 ]
 
-# === Skip detection ===
-def is_camera_in_use():
-    """True only when camera is *actively* streaming.
+# Fired on the hourly long break when squatsEveryHour is on. Kept out of
+# LONG_PROMPTS so the random pool cannot serve it a second time in the hour.
+SQUATS_PROMPT = ("SQUATS", "20 bodyweight squats. Slow and controlled.")
 
-    macOS launches a dedicated assistant process while the camera is in use
-    and tears it down when released. Checking for that process is far more
-    reliable than scanning lsof, which lists frameworks merely linked by
-    browsers or video apps.
+
+_last_headline = None
+
+
+def pick(prompts):
+    """Random prompt, never the same headline twice in a row."""
+    global _last_headline
+    options = [p for p in prompts if p[0] != _last_headline] or list(prompts)
+    choice = random.choice(options)
+    _last_headline = choice[0]
+    return choice
+
+
+def use(prompt):
+    """Record a directly chosen prompt, so the no-repeat rule in pick() spans
+    the scheduled path as well as the random one."""
+    global _last_headline
+    _last_headline = prompt[0]
+    return prompt
+
+
+# === Skip detection ===
+#
+# Process existence is not a camera signal on Apple Silicon: the per-chip
+# appleh*camerad daemon is persistent, not spawned on demand (measured at 27
+# days of uptime on an M4 with the camera off), and the chip number in its
+# name moves with the hardware. The power assertion table is the reliable,
+# permission-free signal instead. coreaudiod publishes an "audio-in" resource
+# for as long as anything holds the microphone and names the process that
+# asked, which covers every real call including audio-only and camera-off.
+# See CHANGELOG 0.3.0.
+
+# Owners of assertions that are always-on system plumbing, never a signal that
+# the user is busy.
+SYSTEM_ASSERTION_OWNERS = {
+    'powerd', 'WindowServer', 'coreaudiod', 'bluetoothd', 'kernel_task',
+    'corebrightnessd', 'sharingd', 'controlcenterd',
+}
+
+# Apps whose "keep the display awake" assertion means presenting, screen
+# sharing or recording. Deliberately not a blanket rule: a browser playing
+# video holds the same assertion, and watching a video should not cancel
+# breaks. Real calls in a browser are caught by the microphone check instead.
+MEDIA_APP_HINTS = (
+    'zoom', 'teams', 'webex', 'slack', 'discord', 'facetime', 'ringcentral',
+    'gotomeeting', 'bluejeans', 'obs', 'quicktime', 'screenflow', 'loom',
+    'cleanshot', 'snagit', 'camtasia', 'descript', 'riverside', 'shottr',
+    'screen sharing', 'screensharing', 'keynote', 'powerpoint',
+    'quickrecorder', 'screenstudio', 'screencapture',
+)
+
+
+def _pgrep(name, exact=True):
+    """One place deciding the flag, the timeout and the exception policy for
+    the process-existence idiom."""
+    try:
+        return subprocess.run(['pgrep', '-x' if exact else '-f', name],
+                              capture_output=True, timeout=2).returncode == 0
+    except Exception:
+        return False
+
+
+def _power_assertions():
+    try:
+        return subprocess.run(['pmset', '-g', 'assertions'],
+                              capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ''
+
+
+def _process_name(pid):
+    try:
+        out = subprocess.run(['ps', '-o', 'comm=', '-p', str(pid)],
+                             capture_output=True, text=True, timeout=2).stdout.strip()
+        return os.path.basename(out) or None
+    except Exception:
+        return None
+
+
+_ASSERTION_HEADER = re.compile(r'\s*pid (\d+)\((.+?)\):(.*)')
+_CREATED_FOR = re.compile(r'Created for PID:\s*(\d+)')
+
+
+def _parse_assertions(txt):
+    """Yield (owner_name, body) per assertion entry.
+
+    An entry is a "   pid N(name): ..." header plus its indented continuation
+    lines. Both checks below read the same parse, so they cannot disagree
+    about what counts as an entry if pmset's format shifts.
     """
-    procs = ('AppleCameraAssistant', 'VDCAssistant', 'appleh13camerad')
-    for p in procs:
-        try:
-            r = subprocess.run(['pgrep', '-x', p], capture_output=True, timeout=2)
-            if r.returncode == 0:
-                return True
-        except Exception:
+    owner, body = None, []
+    for line in txt.splitlines():
+        m = _ASSERTION_HEADER.match(line)
+        if m:
+            if owner is not None:
+                yield owner, "\n".join(body)
+            owner, body = m.group(2), [m.group(3)]
+        elif owner is not None:
+            body.append(line)
+    if owner is not None:
+        yield owner, "\n".join(body)
+
+
+def mic_holder(assertions=None):
+    """Name of the app holding the microphone, or None.
+
+    Returns the requesting app, not coreaudiod which owns the assertion on its
+    behalf, so the skip reason can say which app is responsible.
+    """
+    txt = assertions if assertions is not None else _power_assertions()
+    for _owner, body in _parse_assertions(txt):
+        if 'Resources:' in body and 'audio-in' in body:
+            m = _CREATED_FOR.search(body)
+            return (_process_name(m.group(1)) if m else None) or 'unknown app'
+    return None
+
+
+def display_holding_media_app(assertions=None, extra_hints=()):
+    """Name of a meeting, screen share or recording app keeping the display
+    awake, or None. Catches a muted screen share, which the mic check misses."""
+    txt = assertions if assertions is not None else _power_assertions()
+    hints = tuple(MEDIA_APP_HINTS) + tuple(h.lower() for h in extra_hints)
+    for owner, body in _parse_assertions(txt):
+        if 'PreventUserIdleDisplaySleep' not in body:
             continue
-    return False
+        if owner in SYSTEM_ASSERTION_OWNERS:
+            continue
+        low = owner.lower()
+        if any(h in low for h in hints):
+            return owner
+    return None
+
+
+def is_screen_being_captured():
+    """macOS runs `screencapture` for its own screen recording, and the
+    interactive recorder stays resident for the whole take."""
+    return _pgrep('screencapture')
 
 
 def is_keynote_presenting():
     try:
-        if subprocess.run(['pgrep', '-x', 'Keynote'],
-                          capture_output=True, timeout=2).returncode != 0:
+        if not _pgrep('Keynote'):
             return False
         out = subprocess.run(
             ['osascript', '-e', 'tell application "Keynote" to return playing'],
@@ -161,27 +302,11 @@ def is_keynote_presenting():
 
 def is_powerpoint_presenting():
     try:
-        if subprocess.run(['pgrep', '-x', 'Microsoft PowerPoint'],
-                          capture_output=True, timeout=2).returncode != 0:
+        if not _pgrep('Microsoft PowerPoint'):
             return False
         out = subprocess.run(
             ['osascript', '-e',
              'tell application "Microsoft PowerPoint" to return slide show window of active presentation is not missing value'],
-            capture_output=True, text=True, timeout=3
-        ).stdout
-        return 'true' in out.lower()
-    except Exception:
-        return False
-
-
-def is_zoom_in_meeting():
-    try:
-        if subprocess.run(['pgrep', '-f', 'zoom.us'],
-                          capture_output=True, timeout=2).returncode != 0:
-            return False
-        out = subprocess.run(
-            ['osascript', '-e',
-             'tell application "System Events" to (exists (window 1 of process "zoom.us" whose name contains "Zoom Meeting"))'],
             capture_output=True, text=True, timeout=3
         ).stdout
         return 'true' in out.lower()
@@ -222,13 +347,35 @@ def is_paused():
 
 def reason_to_skip():
     paused, info = is_paused()
-    if paused:                    return f"paused ({info})"
-    if is_camera_in_use():        return "camera in use (call/recording)"
-    if is_zoom_in_meeting():      return "Zoom meeting active"
-    if is_keynote_presenting():   return "Keynote presenting"
-    if is_powerpoint_presenting():return "PowerPoint presenting"
+    if paused:
+        return f"paused ({info})"
+
+    # One pmset call feeds both assertion checks.
+    assertions = _power_assertions()
+
+    holder = mic_holder(assertions)
+    if holder:
+        return f"microphone in use ({holder})"
+
+    owner = display_holding_media_app(assertions, EXTRA_BUSY_APPS)
+    if owner:
+        return f"{owner} presenting or recording"
+
+    if is_screen_being_captured():
+        return "screen recording in progress"
+
+    # Presenting can happen with no microphone and no display assertion, so
+    # these two stay as direct probes. Zoom does not: a meeting always holds
+    # the microphone, so the check above covers it without an AppleScript
+    # round trip and the Automation permission it needs.
+    if is_keynote_presenting():
+        return "Keynote presenting"
+    if is_powerpoint_presenting():
+        return "PowerPoint presenting"
+
     idle = get_idle_seconds()
-    if idle > IDLE_SKIP:          return f"already idle {int(idle//60)} min"
+    if idle > IDLE_SKIP:
+        return f"already idle {int(idle//60)} min"
     return None
 
 
@@ -238,9 +385,30 @@ def play_sound(name="Glass"):
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# Samantha is not installed on every Mac, and `say` just exits silently when
+# the voice is missing, so the spoken cue would vanish with no clue why.
+# Resolve once at startup and fall back to the system default voice.
+def _pick_voice(preferred="Samantha"):
+    try:
+        out = subprocess.run(['say', '-v', '?'], capture_output=True,
+                             text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if line.split(' ', 1)[0] == preferred:
+                return preferred
+    except Exception:
+        pass
+    return None
+
+
+_VOICE = ...  # unresolved sentinel; enumerating voices is slow, so defer it
+
+
 def speak(text):
-    subprocess.Popen(['say', '-v', 'Samantha', text],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    global _VOICE
+    if _VOICE is ...:
+        _VOICE = _pick_voice()
+    cmd = ['say'] + (['-v', _VOICE] if _VOICE else []) + [text]
+    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def notify(msg, title="Take Five"):
@@ -319,9 +487,17 @@ def cli_test():
     time.sleep(2)
     play_sound("Glass")
     speak("Test break.")
-    headline, tip = random.choice(SHORT_PROMPTS)
+    headline, tip = pick(SHORT_PROMPTS)
     show_break(10, f"TEST · {headline}", tip)
     print("Test complete.")
+
+
+def cli_skipreason():
+    """Prints the current skip reason, or nothing. The menu bar app calls this
+    instead of reimplementing the checks, so the two can never disagree."""
+    r = reason_to_skip()
+    if r:
+        print(r)
 
 
 def handle_sigint(signum, frame):
@@ -336,46 +512,64 @@ def run():
     print("  Take Five - 20-20-20 break daemon")
     print(f"  Short break every {WORK_INTERVAL//60} min for {SHORT_BREAK}s")
     print(f"  Long break every {LONG_BREAK_EVERY * (WORK_INTERVAL//60)} min for {LONG_BREAK//60} min")
-    print("  Auto-skips: meetings, Keynote/PPT, camera, idle")
+    if SQUATS_EVERY_HOUR:
+        print("  Squats anchored to the first long break of every hour")
+    print("  Auto-skips: mic in use, screen share/recording, Keynote/PPT, idle")
     print("  Pause:  python3 break_enforcer.py pause 30")
     print("  Resume: python3 break_enforcer.py resume")
     print("  Stop:   Ctrl+C   (or: pkill -f break_enforcer.py)")
     print("=" * 64)
 
-    break_count = _resume_break_count()
+    break_count, last_squats = _resume_session()
+    # Fixed hourly targets, not "an hour since the last one", so a break that
+    # lands slightly early doesn't push every later squats break later still.
+    next_squats = (last_squats or time.time()) + SQUATS_INTERVAL
     while True:
-        next_break = time.time() + WORK_INTERVAL
-        _write_state(next_break, break_count)
+        _write_state(time.time() + WORK_INTERVAL, break_count, last_squats)
 
         time.sleep(WORK_INTERVAL - PRE_WARNING)
 
         skip = reason_to_skip()
         if skip:
             print(f"{LOG} {datetime.now().strftime('%H:%M')} skip pre-warn: {skip}")
+            _write_state(time.time() + PRE_WARNING + WORK_INTERVAL,
+                         break_count, last_squats, skip)
             time.sleep(PRE_WARNING)
             continue
 
-        notify(f"Break in {PRE_WARNING}s. Wrap up.")
+        if PRE_WARNING:
+            notify(f"Break in {PRE_WARNING}s. Wrap up.")
         time.sleep(PRE_WARNING)
 
         skip = reason_to_skip()
         if skip:
             print(f"{LOG} {datetime.now().strftime('%H:%M')} skip break:    {skip}")
+            _write_state(time.time() + WORK_INTERVAL, break_count, last_squats, skip)
             continue
 
         break_count += 1
-        _write_state(time.time() + WORK_INTERVAL, break_count)
         play_sound("Glass")
-        is_long = (break_count % LONG_BREAK_EVERY == 0)
 
-        if is_long:
-            headline, tip = random.choice(LONG_PROMPTS)
-            speak(f"Long break. {headline.lower()}.")
-            show_break(LONG_BREAK, headline, tip)
+        if break_count % LONG_BREAK_EVERY == 0:
+            now = time.time()
+            if SQUATS_EVERY_HOUR and now >= next_squats - SQUATS_GRACE:
+                headline, tip = use(SQUATS_PROMPT)
+                last_squats = now
+                # Step past the target just met, then catch up over any hours
+                # missed while the machine was asleep or the app was paused.
+                next_squats += SQUATS_INTERVAL
+                while next_squats <= now:
+                    next_squats += SQUATS_INTERVAL
+            else:
+                headline, tip = pick(LONG_PROMPTS)
+            duration, phrase = LONG_BREAK, f"Long break. {headline.lower()}."
         else:
-            headline, tip = random.choice(SHORT_PROMPTS)
-            speak("Look away.")
-            show_break(SHORT_BREAK, headline, tip)
+            headline, tip = pick(SHORT_PROMPTS)
+            duration, phrase = SHORT_BREAK, "Look away."
+
+        speak(phrase)
+        _write_state(time.time() + WORK_INTERVAL, break_count, last_squats)
+        show_break(duration, headline, tip)
 
 
 if __name__ == "__main__":
@@ -386,9 +580,10 @@ if __name__ == "__main__":
         elif cmd == "resume": cli_resume()
         elif cmd == "status": cli_status()
         elif cmd == "test":   cli_test()
+        elif cmd == "skipreason": cli_skipreason()
         else:
             print(f"Unknown: {cmd}")
-            print("Usage: break_enforcer.py [pause [mins] | resume | status | test]")
+            print("Usage: break_enforcer.py [pause [mins] | resume | status | test | skipreason]")
             sys.exit(1)
     else:
         run()

@@ -26,6 +26,7 @@ struct Config: Codable {
     var longBreakEvery: Int = 3
     var longBreakMin: Int = 5
     var preWarningSec: Int = 10
+    var squatsEveryHour: Bool = true
 
     static func load() -> Config {
         try? FileManager.default.createDirectory(atPath: APP_SUPPORT, withIntermediateDirectories: true)
@@ -43,6 +44,9 @@ struct Config: Codable {
 struct State: Codable {
     var nextBreakAt: TimeInterval = 0
     var breakCount: Int = 0
+    var lastSquatsAt: TimeInterval = 0
+    var skipReason: String? = nil
+    var writtenAt: TimeInterval = 0
 }
 func loadState() -> State {
     guard let data = try? Data(contentsOf: URL(fileURLWithPath: STATE_PATH)) else { return State() }
@@ -73,8 +77,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var pythonProcess: Process?
     var settingsWindow: NSWindow?
     var settingsFields: [NSTextField] = []
+    var squatsCheckbox: NSButton?
+    // Last skip reason computed off the main thread. The menu renders this
+    // immediately and triggers a refresh for next time; asking the daemon
+    // synchronously here stalled menu opening on a Python cold start.
+    var cachedSkipReason: String?
+    var skipReasonRefreshing = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        rotateLogIfLarge()
         appendLog("===== menubar launch \(Date()) =====")
         setupStatusBar()
         startDaemon()
@@ -118,12 +129,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let menu = statusItem?.menu else { return }
         menu.removeAllItems()
 
+        let (paused, pauseDetail) = pauseInfo()
+        let st = loadState()
+        // Seed from what the daemon last published so the first menu open has
+        // something real to show before any background refresh finishes.
+        if cachedSkipReason == nil { cachedSkipReason = st.skipReason }
+
         // Status header (disabled item)
-        let header = NSMenuItem(title: statusText(), action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: statusText(paused: paused, detail: pauseDetail, state: st),
+                                action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
 
-        let skip = currentSkipReason()
+        let skip = currentSkipReason(paused: paused)
         if let s = skip {
             let info = NSMenuItem(title: "Auto-skip: \(s)", action: nil, keyEquivalent: "")
             info.isEnabled = false
@@ -157,10 +175,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return mi
     }
 
-    func statusText() -> String {
-        let (paused, info) = pauseInfo()
-        if paused { return "PAUSED · \(info ?? "")" }
-        let st = loadState()
+    func statusText(paused: Bool, detail: String?, state st: State) -> String {
+        if paused { return "PAUSED · \(detail ?? "")" }
+        // Liveness before the countdown: state.json outlives the daemon, so a
+        // crashed daemon used to show a timer ticking toward a break that
+        // could never fire.
+        if !daemonAlive() { return "Not running" }
         if st.nextBreakAt > 0 {
             let secs = Int(st.nextBreakAt - Date().timeIntervalSince1970)
             if secs > 0 {
@@ -168,23 +188,52 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 return String(format: "Next break in %d:%02d", m, s)
             }
         }
-        if !daemonAlive() { return "Not running" }
         return "Active"
     }
 
-    func currentSkipReason() -> String? {
-        if pauseInfo().paused { return nil }   // already shown in header
-        if isCameraInUse() { return "camera in use" }
-        if isKeynotePresenting() { return "Keynote presenting" }
-        return nil
+    // Ask the daemon rather than reimplementing the checks. The Swift copy had
+    // already drifted from the Python one (it only knew about the camera and
+    // Keynote), so the menu could claim nothing would be skipped while the
+    // daemon was skipping for another reason entirely.
+    //
+    // Returns what was last computed, and kicks off a background refresh. The
+    // checks spawn pmset, pgrep and osascript behind a Python start-up, which
+    // is far too much to run on the main thread while a menu is opening.
+    func currentSkipReason(paused: Bool) -> String? {
+        if paused { return nil }   // already shown in the header
+        refreshSkipReasonInBackground()
+        return cachedSkipReason
+    }
+
+    func refreshSkipReasonInBackground() {
+        if skipReasonRefreshing { return }
+        skipReasonRefreshing = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let out = runCapture("/usr/bin/python3", [SCRIPT_PATH, "skipreason"], timeout: 10)
+            let reason = out?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.cachedSkipReason = reason.isEmpty ? nil : reason
+                self.skipReasonRefreshing = false
+            }
+        }
     }
 
     // MARK: Daemon control
     // Track our spawned daemon directly. Don't rely on pgrep -f, which
     // race-matches against other pgrep callers using the same pattern.
     func daemonAlive() -> Bool {
-        guard let p = pythonProcess, p.isRunning else { return false }
-        return true
+        if let p = pythonProcess, p.isRunning { return true }
+        // Fall back to a process check so a daemon this instance did not spawn
+        // is not reported as dead, which would hide the countdown.
+        let p = Process()
+        p.launchPath = "/usr/bin/pgrep"
+        p.arguments = ["-f", "break_enforcer.py"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
     }
 
     func startDaemon() {
@@ -202,7 +251,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let p = Process()
         p.launchPath = "/usr/bin/python3"
         p.arguments = [SCRIPT_PATH]
-        if let log = openLogForAppend() {
+        if let log = openLogAppending() {
             p.standardOutput = log
             p.standardError = log
         }
@@ -213,15 +262,6 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch {
             appendLog("FAILED to start daemon: \(error)")
         }
-    }
-
-    private func openLogForAppend() -> FileHandle? {
-        if !FileManager.default.fileExists(atPath: LOG_PATH) {
-            FileManager.default.createFile(atPath: LOG_PATH, contents: nil)
-        }
-        guard let h = FileHandle(forWritingAtPath: LOG_PATH) else { return nil }
-        h.seekToEndOfFile()
-        return h
     }
 
     func stopDaemon() {
@@ -252,39 +292,19 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return p.terminationStatus
     }
 
-    // MARK: Skip detection (mirrors python checks for the menu hint)
-    func isCameraInUse() -> Bool {
-        for proc in ["AppleCameraAssistant", "VDCAssistant", "appleh13camerad"] {
-            let p = Process()
-            p.launchPath = "/usr/bin/pgrep"
-            p.arguments = ["-x", proc]
-            let null = Pipe(); p.standardOutput = null; p.standardError = null
-            do { try p.run() } catch { continue }
-            p.waitUntilExit()
-            if p.terminationStatus == 0 { return true }
-        }
-        return false
-    }
-    func isKeynotePresenting() -> Bool {
-        let check = Process()
-        check.launchPath = "/usr/bin/pgrep"
-        check.arguments = ["-x", "Keynote"]
-        let null = Pipe(); check.standardOutput = null; check.standardError = null
-        do { try check.run() } catch { return false }
-        check.waitUntilExit()
-        if check.terminationStatus != 0 { return false }
+    // Fire and forget. Used for "test", which holds a break window on screen
+    // for 10s; waiting on it would freeze the menu bar for the whole break.
+    func runDaemonCmdDetached(_ args: [String]) {
         let p = Process()
-        p.launchPath = "/usr/bin/osascript"
-        p.arguments = ["-e", "tell application \"Keynote\" to return playing"]
-        let pipe = Pipe(); p.standardOutput = pipe
-        do { try p.run() } catch { return false }
-        p.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        return String(data: data, encoding: .utf8)?.lowercased().contains("true") ?? false
+        p.launchPath = "/usr/bin/python3"
+        p.arguments = [SCRIPT_PATH] + args
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { appendLog("failed to run \(args): \(error)") }
     }
 
     // MARK: Menu actions
-    @objc func testBreak()      { runDaemonCmd(["test"]) }
+    @objc func testBreak()      { runDaemonCmdDetached(["test"]) }
     @objc func pause30()        { runDaemonCmd(["pause", "30"]); refreshMenu() }
     @objc func pause60()        { runDaemonCmd(["pause", "60"]); refreshMenu() }
     @objc func pauseInfinite()  { runDaemonCmd(["pause"]); refreshMenu() }
@@ -307,9 +327,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: Settings window
     @objc func openSettings() {
-        if settingsWindow == nil {
-            settingsWindow = buildSettingsWindow()
-        }
+        // Rebuilt every time so the fields always show what is actually saved.
+        // Reusing the cached window meant that after typing and cancelling,
+        // reopening showed the discarded edits as if they were live settings.
+        settingsWindow?.close()
+        settingsWindow = buildSettingsWindow()
         NSApp.activate(ignoringOtherApps: true)
         settingsWindow?.makeKeyAndOrderFront(nil)
     }
@@ -317,7 +339,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func buildSettingsWindow() -> NSWindow {
         let cfg = Config.load()
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 460, height: 360),
+            contentRect: NSRect(x: 0, y: 0, width: 460, height: 400),
             styleMask: [.titled, .closable],
             backing: .buffered, defer: false)
         w.title = "\(APP_TITLE) Settings"
@@ -366,6 +388,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let e = row("Heads-up notification (seconds):",    cfg.preWarningSec)
         settingsFields = [a, b, c, d, e]
 
+        let squats = NSButton(checkboxWithTitle: "Always squats on the first long break each hour",
+                              target: nil, action: nil)
+        squats.state = cfg.squatsEveryHour ? .on : .off
+        squats.font = NSFont.systemFont(ofSize: 13)
+        stack.addArrangedSubview(squats)
+        squatsCheckbox = squats
+
         let hint = NSTextField(labelWithString:
             "Example: 20 / 20 / 3 / 5 = short break every 20 min, every 3rd one becomes a 5-min long break (≈ once per hour).")
         hint.font = NSFont.systemFont(ofSize: 11)
@@ -410,6 +439,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cfg.longBreakEvery  = max(1, settingsFields[2].integerValue)
         cfg.longBreakMin    = max(1, settingsFields[3].integerValue)
         cfg.preWarningSec   = max(0, settingsFields[4].integerValue)
+        cfg.squatsEveryHour = (squatsCheckbox?.state ?? .on) == .on
         cfg.save()
         settingsWindow?.close()
         stopDaemon()
@@ -421,6 +451,32 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 }
 
 // MARK: - Helpers
+
+// Run a command and capture stdout, killing it if it overruns `timeout`.
+// An unresponsive Keynote can make its AppleEvent reply take arbitrarily long,
+// so the wait is always bounded. Callers run this off the main thread.
+func runCapture(_ path: String, _ args: [String], timeout: TimeInterval) -> String? {
+    let p = Process()
+    p.launchPath = path
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return nil }
+
+    let done = DispatchSemaphore(value: 0)
+    p.terminationHandler = { _ in done.signal() }
+    if done.wait(timeout: .now() + timeout) == .timedOut {
+        p.terminate()
+        if done.wait(timeout: .now() + 0.5) == .timedOut {
+            kill(p.processIdentifier, SIGKILL)
+        }
+        return nil
+    }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    return String(data: data, encoding: .utf8)
+}
+
 func notify(_ msg: String) {
     let safe = msg
         .replacingOccurrences(of: "\\", with: "\\\\")
@@ -431,15 +487,30 @@ func notify(_ msg: String) {
     try? p.run()
 }
 
+// O_APPEND, not open-and-seek. The daemon holds an inherited handle on this
+// same file, and two writers each tracking their own offset were silently
+// overwriting each other's lines. Appending is atomic for both.
+func openLogAppending() -> FileHandle? {
+    let fd = open(LOG_PATH, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+    if fd < 0 { return nil }
+    return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+}
+
 func appendLog(_ msg: String) {
-    let line = msg + "\n"
-    if let data = line.data(using: .utf8) {
-        if let h = FileHandle(forWritingAtPath: LOG_PATH) {
-            h.seekToEndOfFile(); h.write(data); try? h.close()
-        } else {
-            FileManager.default.createFile(atPath: LOG_PATH, contents: data)
-        }
-    }
+    guard let data = (msg + "\n").data(using: .utf8), let h = openLogAppending() else { return }
+    h.write(data)
+    try? h.close()
+}
+
+// Keep the log from growing without limit. One skip line every work interval
+// adds up over months of uptime.
+func rotateLogIfLarge(maxBytes: Int = 1_000_000) {
+    let fm = FileManager.default
+    guard let attrs = try? fm.attributesOfItem(atPath: LOG_PATH),
+          let size = attrs[.size] as? Int, size > maxBytes else { return }
+    let old = LOG_PATH + ".1"
+    try? fm.removeItem(atPath: old)
+    try? fm.moveItem(atPath: LOG_PATH, toPath: old)
 }
 
 // MARK: - Run
